@@ -66,31 +66,29 @@ def qwen2_rmsnorm_fwd(
 @triton.jit
 def qwen2_rmsnorm_bwd(
     dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_partial_ptr,
-    stride, M, rows_per_prog, N: tl.constexpr, BLOCK: tl.constexpr
+    stride, M, N: tl.constexpr, BLOCK: tl.constexpr, BLOCK_M: tl.constexpr
 ):
     pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK)
-    mask = cols < N
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    rmask = rows < M
+    cmask = cols < N
+    mask = rmask[:, None] & cmask[None, :]
+    offs = rows[:, None] * stride + cols[None, :]
 
-    dw_acc = tl.zeros([BLOCK], dtype=tl.float32)
-    start = pid * rows_per_prog
-    end = tl.minimum(start + rows_per_prog, M)
+    dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+    rstd = tl.load(rstd_ptr + rows, mask=rmask, other=0.0)
 
-    for row in range(start, end):
-        dy = tl.load(dy_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
-        rstd = tl.load(rstd_ptr + row)
+    x_hat = x * rstd[:, None]
+    wdy = w[None, :] * dy
+    c1 = tl.sum(x_hat * wdy, axis=1) / N
+    dx = (wdy - x_hat * c1[:, None]) * rstd[:, None]
 
-        x_hat = x * rstd
-        wdy = w * dy
-        c1 = tl.sum(x_hat * wdy, axis=0) / N
-        dx = (wdy - x_hat * c1) * rstd
-
-        tl.store(dx_ptr + row * stride + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-        dw_acc += dy * x_hat
-
-    tl.store(dw_partial_ptr + pid * N + cols, dw_acc, mask=mask)
+    tl.store(dx_ptr + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
+    dw = tl.sum(dy * x_hat, axis=0)
+    tl.store(dw_partial_ptr + pid * N + cols, dw, mask=cmask)
 
 
 class SwiGLU(torch.autograd.Function):
@@ -153,15 +151,13 @@ class FastRMSNorm(torch.autograd.Function):
         dy_2d = dy.contiguous().view(M, N)
 
         dx = torch.empty_like(x_2d)
-        sms = torch.cuda.get_device_properties(x_2d.device).multi_processor_count
-        grid = min(M, sms * 4)
-        rows_per_prog = triton.cdiv(M, grid)
-        grid = triton.cdiv(M, rows_per_prog)
+        BLOCK_M = 4
+        grid = triton.cdiv(M, BLOCK_M)
         dw_partial = torch.empty((grid, N), dtype=torch.float32, device=x_2d.device)
 
         qwen2_rmsnorm_bwd[(grid,)](
-            dy_2d, x_2d, weight, rstd, dx, dw_partial, N, M, rows_per_prog,
-            N=N, BLOCK=ctx.BLOCK, num_warps=4
+            dy_2d, x_2d, weight, rstd, dx, dw_partial, N, M,
+            N=N, BLOCK=ctx.BLOCK, BLOCK_M=BLOCK_M, num_warps=4
         )
         dw = dw_partial.sum(dim=0).to(weight.dtype)
         return dx.view(ctx.orig_shape), dw, None
