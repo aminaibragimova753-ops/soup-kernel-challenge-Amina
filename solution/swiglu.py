@@ -66,24 +66,31 @@ def qwen2_rmsnorm_fwd(
 @triton.jit
 def qwen2_rmsnorm_bwd(
     dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_partial_ptr,
-    stride, N: tl.constexpr, BLOCK: tl.constexpr
+    stride, M, rows_per_prog, N: tl.constexpr, BLOCK: tl.constexpr
 ):
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < N
-
-    dy = tl.load(dy_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(rstd_ptr + row)
 
-    x_hat = x * rstd
-    wdy = w * dy
-    c1 = tl.sum(x_hat * wdy, axis=0) / N
-    dx = (wdy - x_hat * c1) * rstd
+    dw_acc = tl.zeros([BLOCK], dtype=tl.float32)
+    start = pid * rows_per_prog
+    end = tl.minimum(start + rows_per_prog, M)
 
-    tl.store(dx_ptr + row * stride + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-    tl.store(dw_partial_ptr + row * stride + cols, dy * x_hat, mask=mask)
+    for row in range(start, end):
+        dy = tl.load(dy_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+        rstd = tl.load(rstd_ptr + row)
+
+        x_hat = x * rstd
+        wdy = w * dy
+        c1 = tl.sum(x_hat * wdy, axis=0) / N
+        dx = (wdy - x_hat * c1) * rstd
+
+        tl.store(dx_ptr + row * stride + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
+        dw_acc += dy * x_hat
+
+    tl.store(dw_partial_ptr + pid * N + cols, dw_acc, mask=mask)
 
 
 class SwiGLU(torch.autograd.Function):
@@ -146,10 +153,15 @@ class FastRMSNorm(torch.autograd.Function):
         dy_2d = dy.contiguous().view(M, N)
 
         dx = torch.empty_like(x_2d)
-        dw_partial = torch.empty((M, N), dtype=torch.float32, device=x_2d.device)
+        sms = torch.cuda.get_device_properties(x_2d.device).multi_processor_count
+        grid = min(M, sms * 4)
+        rows_per_prog = triton.cdiv(M, grid)
+        grid = triton.cdiv(M, rows_per_prog)
+        dw_partial = torch.empty((grid, N), dtype=torch.float32, device=x_2d.device)
 
-        qwen2_rmsnorm_bwd[(M,)](
-            dy_2d, x_2d, weight, rstd, dx, dw_partial, N, N=N, BLOCK=ctx.BLOCK, num_warps=4
+        qwen2_rmsnorm_bwd[(grid,)](
+            dy_2d, x_2d, weight, rstd, dx, dw_partial, N, M, rows_per_prog,
+            N=N, BLOCK=ctx.BLOCK, num_warps=4
         )
         dw = dw_partial.sum(dim=0).to(weight.dtype)
         return dx.view(ctx.orig_shape), dw, None
